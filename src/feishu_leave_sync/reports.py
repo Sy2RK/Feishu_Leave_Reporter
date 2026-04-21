@@ -11,6 +11,8 @@ from feishu_leave_sync.models import LeaveSegment
 WEEKLY_REPORT_TIME = time(hour=9, minute=0)
 MAX_WEEKLY_REPORT_SEGMENTS = 20
 WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+FULL_DAY_START_TIME = time(hour=10, minute=0)
+FULL_DAY_END_TIME = time(hour=19, minute=0)
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,13 @@ class WeeklyLeaveReport:
     overlapping_today_count: int
     omitted_segment_count: int
     period_key: str
+
+
+@dataclass(frozen=True)
+class DisplayLeaveEntry:
+    start_at: datetime
+    end_at: datetime
+    is_full_day: bool
 
 
 def get_weekly_report_window(now: datetime) -> WeeklyReportWindow:
@@ -102,31 +111,13 @@ def build_weekly_leave_report_card(
     )
 
     header_template = "green" if not segments else "orange"
-    summary_markdown = "\n".join(
-        (
-            "**统计概览**",
-            f"- 已审批生效请假：**{len(segments)} 条**",
-            f"- 涉及员工：**{distinct_user_count} 人**",
-            f"- 今日在途/待开始：**{overlapping_today_count} 条**",
-        )
-    )
-
-    elements = [_markdown_element(summary_markdown)]
+    elements: list[dict] = []
 
     if visible_segments:
-        elements.append(
-            _markdown_element(
-                "以下为本周已通过审批、且在推送时仍未结束的请假安排。",
-                margin="8px 0px 8px 0px",
-            )
-        )
-        for heading, lines in _group_segment_lines(visible_segments).items():
-            elements.append(
-                _markdown_element(
-                    "\n".join((f"**{heading}**", *lines)),
-                    margin="10px 0px 0px 0px",
-                )
-            )
+        for user_id, entries in _group_user_display_entries(visible_segments).items():
+            lines = [f"<at id={user_id}></at>"]
+            lines.extend(_format_display_entry(entry) for entry in entries)
+            elements.append(_markdown_element("\n".join(lines), margin="10px 0px 0px 0px"))
     else:
         elements.append(
             _markdown_element(
@@ -142,19 +133,6 @@ def build_weekly_leave_report_card(
                 margin="10px 0px 0px 0px",
             )
         )
-
-    elements.append(
-        _markdown_element(
-            "\n".join(
-                (
-                    f"生成时间：`{now:%Y-%m-%d %H:%M}`",
-                    f"统计范围：`{window.week_start:%Y-%m-%d}` 至 `{(window.week_end - timedelta(days=1)):%Y-%m-%d}`",
-                    "数据来源：飞书审批已通过记录与本地实时同步状态。",
-                )
-            ),
-            margin="12px 0px 0px 0px",
-        )
-    )
 
     card = {
         "schema": "2.0",
@@ -198,22 +176,68 @@ def build_weekly_leave_report_card(
     )
 
 
-def _group_segment_lines(segments: Sequence[LeaveSegment]) -> "OrderedDict[str, list[str]]":
-    grouped: "OrderedDict[str, list[str]]" = OrderedDict()
+def _group_user_display_entries(segments: Sequence[LeaveSegment]) -> "OrderedDict[str, list[DisplayLeaveEntry]]":
+    grouped: "OrderedDict[str, list[LeaveSegment]]" = OrderedDict()
     for segment in segments:
-        heading = f"{segment.start_at:%m/%d} {WEEKDAY_LABELS[segment.start_at.weekday()]}"
-        grouped.setdefault(heading, []).append(_format_segment_line(segment))
-    return grouped
+        grouped.setdefault(segment.user_id, []).append(segment)
+    return OrderedDict(
+        (user_id, _merge_user_segments(user_segments))
+        for user_id, user_segments in grouped.items()
+    )
 
 
-def _format_segment_line(segment: LeaveSegment) -> str:
-    mention = f"<at id={segment.user_id}></at>"
-    if segment.start_at.date() == segment.end_at.date():
-        return f"- `{segment.start_at:%H:%M} - {segment.end_at:%H:%M}` {mention}"
+def _merge_user_segments(segments: Sequence[LeaveSegment]) -> list[DisplayLeaveEntry]:
+    merged: list[DisplayLeaveEntry] = []
+    for segment in sorted(segments, key=lambda item: (item.start_at, item.end_at, item.instance_code)):
+        is_full_day = _is_full_day_segment(segment)
+        current_entry = DisplayLeaveEntry(
+            start_at=segment.start_at,
+            end_at=segment.end_at,
+            is_full_day=is_full_day,
+        )
+        if not merged:
+            merged.append(current_entry)
+            continue
+
+        previous_entry = merged[-1]
+        if (
+            previous_entry.is_full_day
+            and current_entry.is_full_day
+            and current_entry.start_at.date() == previous_entry.end_at.date() + timedelta(days=1)
+        ):
+            merged[-1] = DisplayLeaveEntry(
+                start_at=previous_entry.start_at,
+                end_at=current_entry.end_at,
+                is_full_day=True,
+            )
+            continue
+
+        merged.append(current_entry)
+    return merged
+
+
+def _format_display_entry(entry: DisplayLeaveEntry) -> str:
+    if entry.is_full_day:
+        if entry.start_at.date() == entry.end_at.date():
+            return f"{_format_day_label(entry.start_at)}整天请假"
+        return f"{_format_day_label(entry.start_at)}-{_format_day_label(entry.end_at)}整天请假"
+    if entry.start_at.date() == entry.end_at.date():
+        return f"{_format_day_label(entry.start_at)} {entry.start_at:%H:%M}-{entry.end_at:%H:%M} 请假"
     return (
-        "- "
-        f"`{segment.start_at:%m/%d %H:%M} → {segment.end_at:%m/%d %H:%M}` "
-        f"{mention}"
+        f"{_format_day_label(entry.start_at)} {entry.start_at:%H:%M}"
+        f" - {_format_day_label(entry.end_at)} {entry.end_at:%H:%M} 请假"
+    )
+
+
+def _format_day_label(value: datetime) -> str:
+    return f"{value:%m/%d}（{WEEKDAY_LABELS[value.weekday()]}）"
+
+
+def _is_full_day_segment(segment: LeaveSegment) -> bool:
+    return (
+        segment.start_at.timetz().replace(tzinfo=None) == FULL_DAY_START_TIME
+        and segment.end_at.timetz().replace(tzinfo=None) == FULL_DAY_END_TIME
+        and segment.end_at.date() >= segment.start_at.date()
     )
 
 

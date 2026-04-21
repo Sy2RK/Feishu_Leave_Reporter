@@ -96,6 +96,32 @@ def test_build_weekly_leave_report_card_contains_mentions_and_summary() -> None:
     assert report.segment_count == 2
     assert report.distinct_user_count == 2
     assert report.period_key == "2026-04-20"
-    assert "<at id=user_1></at>" in combined_content
-    assert "<at id=user_2></at>" in combined_content
-    assert "已审批生效请假：**2 条**" in combined_content
+    assert "<at id=user_1></at>\n04/20（周一） 10:00-18:00 请假" in combined_content
+    assert "<at id=user_2></at>\n04/21（周二） 14:00-14:30 请假" in combined_content
+    assert "统计概览" not in combined_content
+    assert "生成时间" not in combined_content
+    assert "数据来源" not in combined_content
+
+
+def test_build_weekly_leave_report_card_merges_consecutive_full_day_leave_by_user() -> None:
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime(2026, 4, 20, 9, 0, tzinfo=tz)
+    segments = [
+        _segment(
+            "instance-1",
+            user_id="user_1",
+            start_at="2026-04-21T10:00:00+08:00",
+            end_at="2026-04-21T19:00:00+08:00",
+        ),
+        _segment(
+            "instance-2",
+            user_id="user_1",
+            start_at="2026-04-22T10:00:00+08:00",
+            end_at="2026-04-22T19:00:00+08:00",
+        ),
+    ]
+
+    report = build_weekly_leave_report_card(segments, now)
+    combined_content = "\n".join(element["content"] for element in report.card["body"]["elements"])
+
+    assert "<at id=user_1></at>\n04/21（周二）-04/22（周三）整天请假" in combined_content

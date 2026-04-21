@@ -257,7 +257,17 @@ class LeaveSyncService:
                 report.segment_count,
                 report.distinct_user_count,
             )
-            self._api.send_bot_webhook_card(webhook_url, report.card)
+            try:
+                self._api.send_bot_webhook_card(webhook_url, report.card)
+            except Exception:
+                try:
+                    self._store.clear_pending_job(WEEKLY_REPORT_JOB_NAME, report.period_key)
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to clear weekly leave report pending state after webhook send failed: period=%s",
+                        report.period_key,
+                    )
+                raise
             pending_status_persisted = False
             try:
                 self._store.mark_pending_job(
@@ -563,18 +573,30 @@ class LeaveSyncService:
             except Exception:
                 self._store.clear_pending_timeoff_create(segment)
                 raise
-            self._store.set_pending_timeoff_remote_event_id(segment, timeoff_event_id)
 
             try:
                 self._store.upsert_timeoff_event(segment, timeoff_event_id)
             except Exception:
                 LOGGER.exception(
-                    "Failed to persist timeoff mapping after remote create; leaving pending marker in place: instance=%s start=%s end=%s event_id=%s",
+                    "Failed to persist timeoff mapping after remote create; attempting to keep remote event id in pending state for recovery: instance=%s start=%s end=%s event_id=%s",
                     segment.instance_code,
                     segment.start_at.isoformat(),
                     segment.end_at.isoformat(),
                     timeoff_event_id,
                 )
+                try:
+                    self._store.mark_pending_timeoff_create(
+                        segment,
+                        remote_timeoff_event_id=timeoff_event_id,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Failed to persist remote event id into pending recovery state after remote create: instance=%s start=%s end=%s event_id=%s",
+                        segment.instance_code,
+                        segment.start_at.isoformat(),
+                        segment.end_at.isoformat(),
+                        timeoff_event_id,
+                    )
                 raise
 
             self._store.clear_pending_timeoff_create(segment)

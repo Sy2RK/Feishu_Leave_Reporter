@@ -73,6 +73,23 @@ class FailingJobCompletionStore(SQLiteStore):
         super().mark_job_completed(job_name, period_key, details)
 
 
+class LegacyPendingRemoteIdUpdateStore(SQLiteStore):
+    def set_pending_timeoff_remote_event_id(self, segment: LeaveSegment, remote_timeoff_event_id: str) -> None:
+        raise AssertionError("legacy pending remote id update path should not be used")
+
+
+class FailingWebhookApiClient(DummyApiClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_webhook_once = True
+
+    def send_bot_webhook_card(self, webhook_url: str, card):  # noqa: ANN001
+        if self.fail_webhook_once:
+            self.fail_webhook_once = False
+            raise RuntimeError("simulated webhook send failure")
+        super().send_bot_webhook_card(webhook_url, card)
+
+
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
         app_id="cli_123",
@@ -418,6 +435,37 @@ def test_failed_local_persist_after_remote_create_recovers_without_duplicate_rem
         store.close()
 
 
+def test_remote_create_does_not_depend_on_legacy_pending_remote_id_update() -> None:
+    with TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        settings = _settings(temp_path)
+        store = LegacyPendingRemoteIdUpdateStore(settings.db_path)
+        store.initialize()
+        api = DummyApiClient()
+        service = LeaveSyncService(settings, store, api)
+
+        payload = {
+            "uuid": "uuid-no-legacy-remote-id-update",
+            "event": {
+                "type": "leave_approvalV2",
+                "instance_code": "instance-no-legacy-remote-id-update",
+                "open_id": "ou_123",
+                "leave_range": "[[2099-09-05 13:30:00,2099-09-05 18:00:00]]",
+            },
+        }
+
+        service.process_customized_event(payload)
+
+        assert len(api.created_payloads) == 1
+        mappings = store.list_timeoff_events_for_instance("instance-no-legacy-remote-id-update")
+        assert len(mappings) == 1
+        assert mappings[0].timeoff_event_id == "timeoff-1"
+        assert store.list_pending_timeoff_creates_for_instance("instance-no-legacy-remote-id-update") == []
+        assert store.has_processed_event("uuid-no-legacy-remote-id-update") is True
+
+        store.close()
+
+
 def test_revert_cleans_pending_remote_timeoff_create() -> None:
     with TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -612,5 +660,42 @@ def test_weekly_report_does_not_resend_when_completion_persist_fails_once() -> N
         assert len(api.webhook_payloads) == 1
         assert store.has_completed_job("weekly_leave_report", "2026-04-20") is True
         assert store.get_pending_job("weekly_leave_report", "2026-04-20") is None
+
+        store.close()
+
+
+def test_weekly_report_retries_after_webhook_send_failure() -> None:
+    with TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        settings = _settings_with_weekly_report(temp_path)
+        store = SQLiteStore(settings.db_path)
+        store.initialize()
+        store.replace_segments_for_instance(
+            "instance-report",
+            [
+                _segment(
+                    "instance-report",
+                    user_id="user_1",
+                    start_at="2026-04-20T14:00:00+08:00",
+                    end_at="2026-04-20T18:00:00+08:00",
+                )
+            ],
+        )
+        api = FailingWebhookApiClient()
+        service = LeaveSyncService(settings, store, api)
+        service._has_successful_reconcile = True  # noqa: SLF001
+        monday = datetime(2026, 4, 20, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        with pytest.raises(RuntimeError, match="simulated webhook send failure"):
+            service.run_weekly_report_if_due(reason="scheduled", now=monday)
+
+        assert api.webhook_payloads == []
+        assert store.get_pending_job("weekly_leave_report", "2026-04-20") is None
+        assert store.has_completed_job("weekly_leave_report", "2026-04-20") is False
+
+        assert service.run_weekly_report_if_due(reason="scheduled", now=monday) is True
+        assert len(api.webhook_payloads) == 1
+        assert store.get_pending_job("weekly_leave_report", "2026-04-20") is None
+        assert store.has_completed_job("weekly_leave_report", "2026-04-20") is True
 
         store.close()
