@@ -1,0 +1,13 @@
+{
+  "scopes": {
+    "tenant": [
+      "approval:approval:readonly",
+      "approval:approval.list:readonly",
+      "approval:definition",
+      "calendar:time_off:create",
+      "calendar:time_off:delete",
+      "contact:user.employee_id:readonly"
+    ],
+    "user": []
+  }
+}
